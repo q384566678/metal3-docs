@@ -129,19 +129,39 @@ Each `Device` must have its own `Port controller` to monitor the corresponding
 corresponding port according to the `Port` change.Each Port controller must
 implement the method of configuring `Device` specified by the `Device.spec.protocol`.
 
-The following is the processing after `Port CR` changes:
-* Port.spec.configurationRef changed from empty to non-empty
-  * Find the corresponding `Device` CR according to `DeviceRef`, then verify that
-    the configuration of the port is allowed according to the information in the
-    device CR, and then log in to the corresponding device to perform the
-    corresponding configuration operation.
+#### State machine for the controller
 
-* Port.spec.configurationRef changed from non-empty to empty
-  * Find the corresponding `Device` CR according to `DeviceRef`, and then log in
-    to the corresponding device to cancel the corresponding configuration.
+Port controller sets 6 states for `Port.status.state`: `None`, `Created`, `Configuring`,
+`Configured`, `Deleting` and `Deleted`, each state has its own corresponding function.
 
-* Port.spec.configurationRef content changes
-  * Log in to the corresponding device and apply the latest configuration.
+* \<None\>
+  1. Indicates the status of the Port CR when it was first created, and the value
+     of `status.state` is nil.
+  2. The state handler will add finalizers to the Port CR to avoid being deleted,
+     and set the state of CR to `Created`
+* Created
+  1. Indicates waiting for spec.configurationRef to be assigned.
+  2. The state handler check spec.configurationRef's value, if isn't nil set the
+     state of CR to `Configuring`
+* Configuring
+  1. Indicates that the port is being configured.
+  2. The state handler configure port's network and check configuration progress.
+     If finished set the state of CR to `Configured` state
+* Configured
+  1. Indicates that the port configuration is complete.
+  2. The state handler check whether the target configuration is consistent with
+     the actual configuration, return to `Configuring` state and clean `status.configurationRef`
+     when inconsistent
+* Cleaning
+  1. Indicates that the port configuration is being cleared.
+  2. The state handler deconfigure port's network and check deconfiguration progress,
+     when finished clean `spec.configurationRef` and `status.configurationRef` then set
+     CR's state to `Cleaned` state.
+* Cleaned
+  1. Indicates that the port configuration has been cleared.
+  2. The state handler will remove finalizers, if `spec.configurationRef` isn't nil set CR's state to \<none\>
+
+![state.png](https://github.com/Hellcatlk/networkconfiguration-operator/blob/master/docs/state.png)
 
 ### Workflow
 
@@ -157,16 +177,17 @@ Create CR related to BMH's network:
 Create Metal3Machine:
 
 * User creates `Configuration` corresponding to the `Device`.
-* User specifies the `networkConfiguration` field when creating `Metal3Machine`
+* User specifies the `spec.networkConfiguration` field when creating `Metal3Machine`
   CR.
 * CAPM3 filter the BMH by calling the filter() function. Then select a BMH
   according to the original method.
-* Before provisioning, if the machine's network configuration field is not empty,
-  CAPM3 calls the `configureNetwork()` method to fill networkConfiguration into
-  the appropriate `spec.configurationRef`.
-* Port controller starts to configure the network by call device.ConfigurePort().
-* BMO detects that the Port CR corresponding to all its own network cards are
-  configured and continues to provision BMH.
+* Before provisioning, if the machine's `networkConfiguration` field is not empty,
+  CAPM3 will calls the `configureNetwork()` method to fill networkConfiguration into
+  the appropriate `Port.spec.configurationRef`.
+* The Port controller detects that `Port.spec.configurationRef` changes from empty
+  to non-empty, then carry out the corresponding processing.
+* BMO detects that the status.state of the Port CR corresponding to all BMH network
+  cards is empty or `Configured`, and then continues to provision BMH.
 
 Remove Metal3Machine:
 
@@ -174,9 +195,8 @@ Remove Metal3Machine:
 * CAPM3 calls the `deconfigureNetwork()` to find all the `Port` CR corresponding
   to the BMO network cards, and clear their `spec.configurationRef`.
 * Port  controller starts to deconfigure the network by call device.DeConfigurePort().
-* BMO stage detects that the `Port` CR corresponding to all its own network
-  cards are cleared after the configuration is completed and continues to
-  deprovision BMH.
+* BMO detects that the status.state of the Port CR corresponding to all BMH network
+  cards is empty or `Deleted`, and then continue to deprovision BMH.
 
 ### Changes to Current API
 
@@ -184,18 +204,18 @@ Remove Metal3Machine:
 
 ```yaml
 spec:
-  // Specify the network configuration that metal3Machine needs to use
+  # Specify the network configuration that metal3Machine needs to use
   networkConfiguration:
-  // no smartNic
+  # no smartNic
   - ConfigurationRef:
       name: nc1
       kind: SwitchPortConfiguration
       namespace: default
-    // Network card performance required for this network configuration
+    # Network card performance required for this network configuration
     nicHint:
       name: eth0
       smartNIC: false
-  // with smartNic
+  # with smartNic
   - ConfigurationRef:
       name: nc1
       kind: SmartNicConfiguration
@@ -264,25 +284,24 @@ apiVersion: v1alpha1
 kind: SwitchPort
 metaData:
   name: port0
-  // Point to the Divice to which it belongs
+  # Point to the Divice to which it belongs
   ownerRef:
     name: switch0
   finalizers:
 spec:
-  // Represents the port number on the devic to which it belongs
+  # Represents the port number on the devic to which it belongs
   id: 0
-  // The configuration that needs to be configured on this port
+  # The configuration that needs to be configured on this port
   configurationRef:
     name: sc1
     namespace: default
 status:
-  // Indicates the actual configuration status of the port
+  # Indicates the actual configuration status of the port
   state: Configured
-  // Indicates the configuration information currently applied to the port
+  # Indicates the configuration information currently applied to the port
   configurationRef:
     name: sc1
     namespace: default
-  .....
 ```
 ##### SwitchPortConfiguration CRD
 
@@ -295,19 +314,20 @@ metaData:
   finalizers:
     - default-port0
 spec:
-  // Represents the ACL rules implemented in the switch.
+  # Represents the ACL rules implemented in the switch.
   acl:
-    - type: // ipv4, ipv6
-      action: // allow, deny
-      protocol: // TCP, UDP, ICMP, ALL
-      src: // xxx.xxx.xxx.xxx/xx
-      srcPortRange: // 22, 22-30
-      des: // xxx.xxx.xxx.xxx/xx
-      desPortRange: // 22, 22-30
-  // Indicates which mode this port should be set to,  valid values are `access`, `trunk` or `hybrid`.
+    - type: # ipv4, ipv6
+      action: # allow, deny
+      protocol: # TCP, UDP, ICMP, ALL
+      src: # xxx.xxx.xxx.xxx/xx
+      srcPortRange: # 22, 22-30
+      des: # xxx.xxx.xxx.xxx/xx
+      desPortRange: # 22, 22-30
+  # Indicates which mode this port should be set to.
+  # Allowed values: access, trunk, hybrid
   type: accesss
   untaggedVLAN: 1
-  // Indicates which VLAN this port should be placed in.
+  # Indicates which VLAN this port should be placed in.
   vlans:
     - id: 2
     - id: 3
@@ -322,27 +342,112 @@ metaData:
   name: switch0
   namespace: default
 spec:
-  // Indicates the configured protocol
-  protocol: ansible
-  // The type of OS this switch runs
-  os: fos
-  // IP Address of the switch
-  ip: 192.168.0.1
-  // Port to use for SSH connection
-  port: 22
+  # Indicates the configured protocol, can't specify multiple protocol
+  # Allowed values: cli, snmp, netconf, ovs, openflow
+  protocol: cli
+  # SwitchConfiguration CR's name
+  configuration:
   secret:
-  // Restricted ports in the switch
+  # Restricted ports in the switch
   restrictedPorts:
-    // portID
-    0:
-      // True if this port is not available, false otherwise
+    <SwitchPort CR's name>:
+      portID: if 0/1
+      # True if this port is not available, false otherwise
       disabled: false
-      // Indicates the range of VLANs allowed by this port in the switch
+      # Indicates the range of VLANs allowed by this port in the switch
       vlanRange: 1, 6-10
-      // True if this port can be used as a trunk port, false otherwise
+      # True if this port can be used as a trunk port, false otherwise
       trunkDisable: false
-    2:
-      ...
+```
+
+##### SwitchConfiguration CRDs
+
+SwitchConfiguration CRDs include the login information of switch for different protocol in Switch CRD.
+
+CLISwitchConfiguration CRD
+```yaml
+apiVersion: v1alpha1
+kind: CLISwitchConfiguration
+metaData:
+  name: sc0
+  namespace: default
+spec:
+  # The type of OS this switch runs
+  os: fos
+  # The ip address of the switch
+  ip: 192.168.0.1
+  # The port to use for SSH connection
+  port: 22
+  # Login credentials of switch
+  secret:
+```
+
+SNMPSwitchConfiguration CRD
+```yaml
+apiVersion: v1alpha1
+kind: SNMPSwitchConfiguration
+metaData:
+  name: sc0
+  namespace: default
+spec:
+  mib:
+  # The ip address of the switch
+  ip: 192.168.0.1
+  # The port of SNMP
+  port: 161
+  # Login credentials of switch
+  secret:
+```
+
+NETConfSwitchConfiguration CRD
+```yaml
+apiVersion: v1alpha1
+kind: NETConfSwitchConfiguration
+metaData:
+  name: sc0
+  namespace: default
+spec:
+  # The ip address of switch
+  ip: 192.168.0.1
+  # The port of netconf client
+  port: 830
+  # The login credentials of switch
+  secret:
+```
+
+OVSSwitchConfiguration CRD
+```yaml
+apiVersion: v1alpha1
+kind: OVSSwitchConfiguration
+metaData:
+  name: sc0
+  namespace: default
+spec:
+  # The ip address of switch
+  ip: 192.168.0.1
+  # The port to use for SSH connection
+  port: 22
+  # The login credentials of switch
+  secret:
+```
+
+OpenflowSwitchConfiguration CRD
+```yaml
+apiVersion: v1alpha1
+kind: OpenflowSwitchConfiguration
+metaData:
+  name: sc0
+  namespace: default
+spec:
+  # The ip address of switch
+  ip: 192.168.0.1
+  # The port of openflow
+  port: 6633
+  # The version of openflow protocol
+  # Allow values: 1.0, 1.1, 1.2, 1.3
+  version: 1.3
+  # The login credentials of switch
+  secret:
 ```
 
 ##### SwitchPort Controller
@@ -373,15 +478,15 @@ spec:
   configurationRef:
     name: sn1
     namespace: default
-  // Represents the next port information of this port link
+  # Represents the next port information of this port link
   nextPortRef:
     name: port3
     kind: SwitchPort
     namespace: default
 status:
-  // Indicates the actual configuration status of the port
+  # Indicates the actual configuration status of the port
   state: Configured
-  // Indicates the configuration information currently applied to the port
+  # Indicates the configuration information currently applied to the port
   configurationRef:
     name: sn1
     namespace: default
