@@ -131,35 +131,46 @@ implement the method of configuring `Device` specified by the `Device.spec.proto
 
 #### State machine for the controller
 
-Port controller sets 6 states for `Port.status.state`: `None`, `Created`, `Configuring`,
-`Configured`, `Deleting` and `Deleted`, each state has its own corresponding function.
+Port controller sets 6 states for `Port.status.state`: `None`, `Idle`, `Validating`,
+`Configuring`, `Active`, `Cleaning` and `Deleting`, each state has its own
+corresponding function.
 
 * \<None\>
   1. Indicates the status of the Port CR when it was first created, and the value
      of `status.state` is nil.
   2. The state handler will add finalizers to the Port CR to avoid being deleted,
-     and set the state of CR to `Created`
-* Created
+     and set the state of CR to `Idle`
+* Idle - Steady state
   1. Indicates waiting for spec.configurationRef to be assigned.
   2. The state handler check spec.configurationRef's value, if isn't nil set the
-     state of CR to `Configuring`
+     state of CR to `Validating`
+  3. If deletionTimestamp set, goes to Deleting
+* Validating
+  1. Indicates that the switch and configuration file are verified
+  2. The state handlerwill verify whether the switch can be connected and whether
+     the specified configuration CR exists. If the verification is successful,
+     the state is set to `Configuring`. If it fails, set the state to `Idle`.
 * Configuring
   1. Indicates that the port is being configured.
   2. The state handler configure port's network and check configuration progress.
-     If finished set the state of CR to `Configured` state
-* Configured
+     If finished set the state of CR to `Active` state
+* Active - Steady State
   1. Indicates that the port configuration is complete.
   2. The state handler check whether the target configuration is consistent with
      the actual configuration, return to `Configuring` state and clean `status.configurationRef`
      when inconsistent
+  3. If deletionTimestamp is set -> got to Cleaning
 * Cleaning
   1. Indicates that the port configuration is being cleared.
   2. The state handler deconfigure port's network and check deconfiguration progress,
      when finished clean `spec.configurationRef` and `status.configurationRef` then set
-     CR's state to `Cleaned` state.
-* Cleaned
+     CR's state to `Idle` state.
+  3. If deletionTimestamp set, goes to Deleting
+* Deleting
+Reached when in Idle state + deletionTimestamp set
   1. Indicates that the port configuration has been cleared.
-  2. The state handler will remove finalizers, if `spec.configurationRef` isn't nil set CR's state to \<none\>
+  2. Prepares for deletion
+  3. The state handler will remove finalizers
 
 ![state.png](https://github.com/Hellcatlk/networkconfiguration-operator/blob/master/docs/state.png)
 
@@ -167,7 +178,7 @@ Port controller sets 6 states for `Port.status.state`: `None`, `Created`, `Confi
 
 Create CR related to BMH's network:
 
-* Administrator creates the corresponding `Device` CR according to the
+* Administrator/Infra team creates the corresponding `Device` CR according to the
   specific network device.
 * Administrator creates a `BareMetalHost` CR and fills in the content in `bmh.spec.ports`
   according to the actual network connection.
@@ -187,7 +198,7 @@ Create Metal3Machine:
 * The Port controller detects that `Port.spec.configurationRef` changes from empty
   to non-empty, then carry out the corresponding processing.
 * BMO detects that the status.state of the Port CR corresponding to all BMH network
-  cards is empty or `Configured`, and then continues to provision BMH.
+  cards is empty or `Active`, and then continues to provision BMH.
 
 Remove Metal3Machine:
 
@@ -196,7 +207,7 @@ Remove Metal3Machine:
   to the BMO network cards, and clear their `spec.configurationRef`.
 * Port  controller starts to deconfigure the network by call device.DeConfigurePort().
 * BMO detects that the status.state of the Port CR corresponding to all BMH network
-  cards is empty or `Deleted`, and then continue to deprovision BMH.
+  cards is empty or `Deleting`, and then continue to deprovision BMH.
 
 ### Changes to Current API
 
@@ -289,8 +300,6 @@ metaData:
     name: switch0
   finalizers:
 spec:
-  # Represents the port number on the devic to which it belongs
-  id: 0
   # The configuration that needs to be configured on this port
   configurationRef:
     name: sc1
@@ -474,7 +483,6 @@ metaData:
   finalizers:
   - defaulf-bm0
 spec:
-  id: 0
   configurationRef:
     name: sn1
     namespace: default
